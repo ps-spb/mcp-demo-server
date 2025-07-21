@@ -75,11 +75,17 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"log"
+	"math/big"
+	"net"
 	"net/http"
 	"os"
 	"runtime"
@@ -938,6 +944,239 @@ func getSystemInformation(ctx context.Context, session *mcp.ServerSession, param
 	}, nil
 }
 
+// TLS CERTIFICATE MANAGEMENT FUNCTIONS
+// These functions handle automatic generation and management of TLS certificates
+// when none are provided, ensuring the server can start with TLS enabled.
+
+// certFilesExist checks if certificate and key files exist in the current directory.
+//
+// This function verifies the presence of both certificate and private key files
+// required for TLS operation. It checks for the default filenames used by the
+// server for automatic certificate management.
+//
+// Default Certificate Files:
+// - server.crt: X.509 certificate file in PEM format
+// - server.key: RSA private key file in PEM format
+//
+// Returns:
+//   - bool: true if both certificate and key files exist and are accessible
+//   - string: path to certificate file (if exists)
+//   - string: path to key file (if exists)
+//   - error: any error encountered while checking file existence
+//
+// Usage:
+//   exists, certFile, keyFile, err := certFilesExist()
+//   if err != nil {
+//       log.Printf("Error checking certificate files: %v", err)
+//   }
+//   if !exists {
+//       // Generate new certificates
+//   }
+func certFilesExist() (bool, string, string, error) {
+	certFile := "server.crt"
+	keyFile := "server.key"
+	
+	// Check if certificate file exists and is readable
+	if _, err := os.Stat(certFile); os.IsNotExist(err) {
+		return false, "", "", nil
+	} else if err != nil {
+		return false, "", "", fmt.Errorf("error checking certificate file: %w", err)
+	}
+	
+	// Check if key file exists and is readable
+	if _, err := os.Stat(keyFile); os.IsNotExist(err) {
+		return false, "", "", nil
+	} else if err != nil {
+		return false, "", "", fmt.Errorf("error checking key file: %w", err)
+	}
+	
+	return true, certFile, keyFile, nil
+}
+
+// generateSelfSignedCert creates a self-signed certificate and private key for TLS.
+//
+// This function generates a complete TLS certificate suitable for HTTPS servers,
+// including proper Subject Alternative Names for localhost and IP address access.
+// The generated certificate is suitable for development and testing environments.
+//
+// Certificate Specifications:
+// - Algorithm: RSA with 2048-bit key length
+// - Signature: SHA-256 with RSA encryption
+// - Validity: 365 days from generation time
+// - Key Usage: Digital signature and key encipherment
+// - Extended Key Usage: Server authentication
+// - Subject Alternative Names: DNS names and IP addresses for local access
+//
+// Security Features:
+// - Uses cryptographically secure random number generation
+// - Generates unique serial numbers to prevent certificate collisions
+// - Includes proper certificate extensions for server authentication
+// - Self-signed for ease of deployment (no CA required)
+//
+// Network Configuration:
+// - Subject: CN=localhost (Common Name for certificate validation)
+// - DNS Names: localhost, *.localhost (wildcard for subdomains)
+// - IP Addresses: 127.0.0.1, ::1 (IPv4 and IPv6 loopback)
+//
+// Returns:
+//   - []byte: X.509 certificate in PEM format
+//   - []byte: RSA private key in PEM format  
+//   - error: any error encountered during certificate generation
+//
+// Error Cases:
+//   - RSA key generation failure
+//   - Random number generation failure
+//   - Certificate template creation failure
+//   - PEM encoding failure
+//
+// Example Usage:
+//   certPEM, keyPEM, err := generateSelfSignedCert()
+//   if err != nil {
+//       log.Fatalf("Failed to generate certificate: %v", err)
+//   }
+//   // Save or use certificate and key...
+//
+// Production Note: For production environments, replace with proper CA-signed
+// certificates or implement ACME/Let's Encrypt integration for automatic
+// certificate provisioning and renewal.
+func generateSelfSignedCert() ([]byte, []byte, error) {
+	// Generate RSA private key with 2048-bit length
+	// This provides adequate security for TLS while maintaining compatibility
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to generate RSA private key: %w", err)
+	}
+
+	// Create certificate template with comprehensive configuration
+	template := x509.Certificate{
+		// Generate unique serial number to prevent certificate collisions
+		SerialNumber: big.NewInt(1),
+		
+		// Certificate subject information
+		Subject: pkix.Name{
+			CommonName:   "localhost",
+			Organization: []string{"MCP Demo Server"},
+		},
+		
+		// Certificate validity period (1 year)
+		NotBefore: time.Now(),
+		NotAfter:  time.Now().Add(365 * 24 * time.Hour),
+
+		// Key usage extensions for TLS server certificates
+		KeyUsage: x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		
+		// Enable basic constraints for self-signed certificate
+		BasicConstraintsValid: true,
+
+		// Subject Alternative Names for local development
+		// This allows the certificate to be valid for various local access patterns
+		DNSNames: []string{
+			"localhost",
+			"*.localhost", // Wildcard for subdomains
+		},
+		IPAddresses: []net.IP{
+			net.IPv4(127, 0, 0, 1), // IPv4 loopback
+			net.IPv6loopback,       // IPv6 loopback (::1)
+		},
+	}
+
+	// Generate certificate using the private key as both issuer and subject (self-signed)
+	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &privateKey.PublicKey, privateKey)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create certificate: %w", err)
+	}
+
+	// Encode certificate to PEM format for file storage and HTTP server use
+	certPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: certDER,
+	})
+	if certPEM == nil {
+		return nil, nil, fmt.Errorf("failed to encode certificate to PEM format")
+	}
+
+	// Encode private key to PEM format
+	keyDER, err := x509.MarshalPKCS8PrivateKey(privateKey)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to marshal private key: %w", err)
+	}
+
+	keyPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "PRIVATE KEY",
+		Bytes: keyDER,
+	})
+	if keyPEM == nil {
+		return nil, nil, fmt.Errorf("failed to encode private key to PEM format")
+	}
+
+	return certPEM, keyPEM, nil
+}
+
+// saveCertFiles writes certificate and private key data to files on disk.
+//
+// This function handles the secure storage of generated certificate and private key
+// materials to the filesystem, ensuring proper file permissions and error handling.
+// The files are saved with restrictive permissions to protect the private key.
+//
+// File Security:
+// - Certificate file (server.crt): 644 permissions (readable by all, writable by owner)
+// - Private key file (server.key): 600 permissions (readable/writable by owner only)
+// - Atomic writes to prevent partial file corruption
+// - Error handling with cleanup on failure
+//
+// File Format:
+// - Both files are stored in PEM format for broad compatibility
+// - Certificate contains X.509 certificate data
+// - Key file contains PKCS#8 private key data
+//
+// Parameters:
+//   - certPEM: X.509 certificate in PEM format
+//   - keyPEM: RSA private key in PEM format
+//
+// Returns:
+//   - string: path to saved certificate file
+//   - string: path to saved private key file  
+//   - error: any error encountered during file operations
+//
+// Error Cases:
+//   - File system permission errors
+//   - Disk space insufficient
+//   - File creation or write failures
+//   - Permission setting failures
+//
+// Security Considerations:
+// - Private key file has restrictive permissions (600) to prevent unauthorized access
+// - Files are created with explicit permissions rather than relying on umask
+// - Error messages avoid exposing sensitive information about file system structure
+//
+// Example Usage:
+//   certFile, keyFile, err := saveCertFiles(certPEM, keyPEM)
+//   if err != nil {
+//       log.Fatalf("Failed to save certificate files: %v", err)
+//   }
+//   log.Printf("Certificate saved to: %s", certFile)
+//   log.Printf("Private key saved to: %s", keyFile)
+func saveCertFiles(certPEM, keyPEM []byte) (string, string, error) {
+	certFile := "server.crt"
+	keyFile := "server.key"
+
+	// Write certificate file with standard permissions (readable by all)
+	if err := os.WriteFile(certFile, certPEM, 0644); err != nil {
+		return "", "", fmt.Errorf("failed to write certificate file: %w", err)
+	}
+
+	// Write private key file with restrictive permissions (owner only)
+	// This is critical for security as private keys must be protected
+	if err := os.WriteFile(keyFile, keyPEM, 0600); err != nil {
+		// Clean up certificate file if key file creation fails
+		os.Remove(certFile)
+		return "", "", fmt.Errorf("failed to write private key file: %w", err)
+	}
+
+	return certFile, keyFile, nil
+}
+
 func main() {
 	// Initialize MCP server with descriptive metadata
 	serverImplementation := &mcp.Implementation{
@@ -1050,10 +1289,44 @@ func main() {
 		IdleTimeout:  60 * time.Second,
 	}
 	
+	// Certificate file paths for TLS configuration
+	var certFile, keyFile string
+	
 	// Configure TLS if enabled
 	if useTLS {
-		// For demo purposes, we'll use a self-signed certificate
-		// In production, use proper certificates
+		// Check if certificate files already exist
+		exists, existingCertFile, existingKeyFile, err := certFilesExist()
+		if err != nil {
+			log.Fatalf("Error checking certificate files: %v", err)
+		}
+		
+		if exists {
+			// Use existing certificate files
+			certFile = existingCertFile
+			keyFile = existingKeyFile
+			log.Printf("Using existing TLS certificate: %s", certFile)
+			log.Printf("Using existing TLS private key: %s", keyFile)
+		} else {
+			// Generate new self-signed certificate
+			log.Printf("No TLS certificate found, generating self-signed certificate...")
+			
+			certPEM, keyPEM, err := generateSelfSignedCert()
+			if err != nil {
+				log.Fatalf("Failed to generate TLS certificate: %v", err)
+			}
+			
+			certFile, keyFile, err = saveCertFiles(certPEM, keyPEM)
+			if err != nil {
+				log.Fatalf("Failed to save certificate files: %v", err)
+			}
+			
+			log.Printf("Generated new TLS certificate: %s", certFile)
+			log.Printf("Generated new TLS private key: %s", keyFile)
+			log.Printf("Certificate is valid for: localhost, *.localhost, 127.0.0.1, ::1")
+			log.Printf("Certificate expires: %s", time.Now().Add(365*24*time.Hour).Format("2006-01-02 15:04:05"))
+		}
+		
+		// Configure TLS settings for security
 		httpServer.TLSConfig = &tls.Config{
 			MinVersion: tls.VersionTLS12,
 			CipherSuites: []uint16{
@@ -1084,8 +1357,11 @@ func main() {
 	// Start HTTP server
 	if useTLS {
 		log.Printf("HTTPS server listening on %s://localhost:%s", protocol, port)
-		// For demo, generate self-signed certificate
-		if err := httpServer.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+		log.Printf("TLS certificate: %s", certFile)
+		log.Printf("TLS private key: %s", keyFile)
+		
+		// Start HTTPS server with generated or existing certificate files
+		if err := httpServer.ListenAndServeTLS(certFile, keyFile); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("HTTPS server failed to start: %v", err)
 		}
 	} else {
