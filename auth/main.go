@@ -96,7 +96,59 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/modelcontextprotocol/go-sdk/jsonschema"
+	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 )
+
+// CONFIGURATION STRUCTURES
+// These types define the server configuration with support for CLI flags, environment
+// variables, and YAML configuration files with precedence order:
+// CLI flags > Environment variables > YAML config > Defaults
+
+// Config represents the complete server configuration structure.
+// This configuration supports multiple input methods (CLI, env vars, YAML)
+// following the 12-factor app configuration principles.
+type Config struct {
+	// Server configuration
+	Server ServerConfig `mapstructure:"server" yaml:"server"`
+	
+	// OAuth 2.1 configuration  
+	OAuth OAuthConfig `mapstructure:"oauth" yaml:"oauth"`
+	
+	// TLS configuration
+	TLS TLSConfig `mapstructure:"tls" yaml:"tls"`
+	
+	// Debug and logging configuration
+	Debug bool `mapstructure:"debug" yaml:"debug"`
+}
+
+// ServerConfig contains HTTP server configuration options.
+type ServerConfig struct {
+	// Host specifies the interface to bind to (default: "localhost")
+	// Use "0.0.0.0" to bind to all interfaces for container deployments
+	Host string `mapstructure:"host" yaml:"host"`
+	
+	// Port specifies the server port (default: 8080 for HTTP, 8443 for HTTPS)
+	Port string `mapstructure:"port" yaml:"port"`
+}
+
+// OAuthConfig contains OAuth 2.1 specific configuration options.
+type OAuthConfig struct {
+	// TokenExpiry sets access token lifetime in seconds (default: 3600)
+	TokenExpiry int `mapstructure:"token_expiry" yaml:"token_expiry"`
+}
+
+// TLSConfig contains TLS/HTTPS configuration options.
+type TLSConfig struct {
+	// Enabled determines whether to use HTTPS (default: false for demo)
+	Enabled bool `mapstructure:"enabled" yaml:"enabled"`
+	
+	// CertFile path to TLS certificate file (auto-generated if not provided)
+	CertFile string `mapstructure:"cert_file" yaml:"cert_file"`
+	
+	// KeyFile path to TLS private key file (auto-generated if not provided)  
+	KeyFile string `mapstructure:"key_file" yaml:"key_file"`
+}
 
 // DATA STRUCTURES
 // These types define the request/response structures for MCP tools and OAuth operations.
@@ -1918,7 +1970,130 @@ func saveCertFiles(certPEM, keyPEM []byte) (string, string, error) {
 	return certFile, keyFile, nil
 }
 
-func main() {
+// CONFIGURATION MANAGEMENT FUNCTIONS
+// These functions handle CLI parsing, config loading, and default value setup
+
+// loadConfiguration sets up viper configuration with proper precedence:
+// CLI flags > Environment variables > YAML config > Defaults
+func loadConfiguration() (*Config, error) {
+	// Set up default configuration values
+	viper.SetDefault("server.host", "localhost")
+	viper.SetDefault("server.port", "8080")  // HTTP default
+	viper.SetDefault("oauth.token_expiry", 3600)
+	viper.SetDefault("tls.enabled", false)  // Demo-friendly default
+	viper.SetDefault("tls.cert_file", "server.crt")
+	viper.SetDefault("tls.key_file", "server.key")
+	viper.SetDefault("debug", false)
+	
+	// Environment variable configuration
+	viper.SetEnvPrefix("MCP")
+	viper.AutomaticEnv()
+	
+	// Map environment variables to config structure
+	viper.BindEnv("server.host", "MCP_SERVER_HOST")
+	viper.BindEnv("server.port", "MCP_SERVER_PORT") 
+	viper.BindEnv("oauth.token_expiry", "MCP_TOKEN_EXPIRY")
+	viper.BindEnv("tls.enabled", "MCP_USE_TLS")
+	viper.BindEnv("tls.cert_file", "MCP_TLS_CERT_FILE")
+	viper.BindEnv("tls.key_file", "MCP_TLS_KEY_FILE")
+	viper.BindEnv("debug", "MCP_DEBUG_MODE")
+	
+	// Read YAML config file if it exists
+	viper.SetConfigName("config")
+	viper.SetConfigType("yaml")
+	viper.AddConfigPath(".")
+	viper.AddConfigPath("/etc/mcp-demo/")
+	viper.AddConfigPath("$HOME/.mcp-demo/")
+	
+	// Read config file (ignore if not found)
+	if err := viper.ReadInConfig(); err != nil {
+		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
+			return nil, fmt.Errorf("error reading config file: %w", err)
+		}
+		// Config file not found is OK, we'll use defaults + env vars + CLI flags
+	}
+	
+	// Unmarshal configuration into struct
+	var config Config
+	if err := viper.Unmarshal(&config); err != nil {
+		return nil, fmt.Errorf("error unmarshaling config: %w", err)
+	}
+	
+	// Adjust port default based on TLS setting if not explicitly set
+	if !viper.IsSet("server.port") {
+		if config.TLS.Enabled {
+			config.Server.Port = "8443"  // HTTPS default
+		} else {
+			config.Server.Port = "8080"  // HTTP default  
+		}
+	}
+	
+	return &config, nil
+}
+
+// createRootCommand creates the main cobra command with all CLI flags
+func createRootCommand() *cobra.Command {
+	var configFile string
+	
+	rootCmd := &cobra.Command{
+		Use:   "mcp-demo-server",
+		Short: "OAuth 2.1 authenticated MCP server",
+		Long: `MCP Demo Server - Phase 3 (OAuth 2.1 Authentication)
+
+A Model Context Protocol (MCP) server implementation in Go that demonstrates 
+OAuth 2.1 authentication following the MCP specification. This server provides
+three primary tools with comprehensive security features:
+
+• File Reader (read_file) - Read file contents from filesystem
+• Directory Lister (list_directory) - List directory contents  
+• System Information (get_system_info) - Get system information
+
+Configuration precedence: CLI flags > Environment variables > YAML config > Defaults`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runServer()
+		},
+	}
+	
+	// Global flags
+	rootCmd.PersistentFlags().StringVar(&configFile, "config", "", "config file path (default: ./config.yaml)")
+	rootCmd.PersistentFlags().String("host", "localhost", "server host to bind to")
+	rootCmd.PersistentFlags().String("port", "", "server port (default: 8080 for HTTP, 8443 for HTTPS)")
+	rootCmd.PersistentFlags().Bool("tls", false, "enable HTTPS/TLS")
+	rootCmd.PersistentFlags().String("cert", "server.crt", "TLS certificate file path")
+	rootCmd.PersistentFlags().String("key", "server.key", "TLS private key file path")
+	rootCmd.PersistentFlags().Int("token-expiry", 3600, "OAuth token expiry in seconds")
+	rootCmd.PersistentFlags().Bool("debug", false, "enable debug mode")
+	
+	// Bind CLI flags to viper
+	viper.BindPFlag("server.host", rootCmd.PersistentFlags().Lookup("host"))
+	viper.BindPFlag("server.port", rootCmd.PersistentFlags().Lookup("port"))
+	viper.BindPFlag("tls.enabled", rootCmd.PersistentFlags().Lookup("tls"))
+	viper.BindPFlag("tls.cert_file", rootCmd.PersistentFlags().Lookup("cert"))
+	viper.BindPFlag("tls.key_file", rootCmd.PersistentFlags().Lookup("key"))
+	viper.BindPFlag("oauth.token_expiry", rootCmd.PersistentFlags().Lookup("token-expiry"))
+	viper.BindPFlag("debug", rootCmd.PersistentFlags().Lookup("debug"))
+	
+	// Set config file if provided
+	if configFile != "" {
+		viper.SetConfigFile(configFile)
+	}
+	
+	return rootCmd
+}
+
+// runServer contains the main server logic extracted from the original main()
+func runServer() error {
+	// Load configuration
+	config, err := loadConfiguration()
+	if err != nil {
+		return fmt.Errorf("failed to load configuration: %w", err)
+	}
+	
+	return startMCPServer(config)
+}
+
+// startMCPServer contains the extracted main server startup logic
+func startMCPServer(config *Config) error {
 	// Initialize MCP server with descriptive metadata
 	serverImplementation := &mcp.Implementation{
 		Name:    "mcp-demo-server-auth",
@@ -1978,14 +2153,9 @@ func main() {
 		},
 	}, getSystemInformation)
 	
-	// Configure server port (default to 8443 for TLS)
-	port := os.Getenv("MCP_SERVER_PORT")
-	if port == "" {
-		port = "8443"
-	}
-	
-	// Configure TLS (use environment variables for production)
-	useTLS := os.Getenv("MCP_USE_TLS") != "false"
+	// Use configuration from the new config system
+	port := config.Server.Port
+	useTLS := config.TLS.Enabled
 	
 	// Log server startup
 	log.Printf("Starting MCP Demo Server (v%s) - OAuth 2.1 Authentication", serverImplementation.Version)
@@ -2031,16 +2201,21 @@ func main() {
 	
 	// Configure TLS if enabled
 	if useTLS {
-		// Check if certificate files already exist
-		exists, existingCertFile, existingKeyFile, err := certFilesExist()
-		if err != nil {
-			log.Fatalf("Error checking certificate files: %v", err)
+		// Use configured certificate file paths
+		certFile = config.TLS.CertFile
+		keyFile = config.TLS.KeyFile
+		
+		// Check if certificate files already exist at configured paths
+		certExists := true
+		if _, err := os.Stat(certFile); os.IsNotExist(err) {
+			certExists = false
+		}
+		if _, err := os.Stat(keyFile); os.IsNotExist(err) {
+			certExists = false
 		}
 		
-		if exists {
+		if certExists {
 			// Use existing certificate files
-			certFile = existingCertFile
-			keyFile = existingKeyFile
 			log.Printf("Using existing TLS certificate: %s", certFile)
 			log.Printf("Using existing TLS private key: %s", keyFile)
 		} else {
@@ -2049,12 +2224,16 @@ func main() {
 			
 			certPEM, keyPEM, err := generateSelfSignedCert()
 			if err != nil {
-				log.Fatalf("Failed to generate TLS certificate: %v", err)
+				return fmt.Errorf("failed to generate TLS certificate: %w", err)
 			}
 			
-			certFile, keyFile, err = saveCertFiles(certPEM, keyPEM)
-			if err != nil {
-				log.Fatalf("Failed to save certificate files: %v", err)
+			// Save to configured file paths
+			if err := os.WriteFile(certFile, certPEM, 0644); err != nil {
+				return fmt.Errorf("failed to write certificate file: %w", err)
+			}
+			if err := os.WriteFile(keyFile, keyPEM, 0600); err != nil {
+				os.Remove(certFile) // cleanup
+				return fmt.Errorf("failed to write private key file: %w", err)
 			}
 			
 			log.Printf("Generated new TLS certificate: %s", certFile)
@@ -2134,12 +2313,24 @@ func main() {
 		
 		// Start HTTPS server with generated or existing certificate files
 		if err := httpServer.ListenAndServeTLS(certFile, keyFile); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("HTTPS server failed to start: %v", err)
+			return fmt.Errorf("HTTPS server failed to start: %w", err)
 		}
 	} else {
 		log.Printf("HTTP server listening on %s://localhost:%s", protocol, port)
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("HTTP server failed to start: %v", err)
+			return fmt.Errorf("HTTP server failed to start: %w", err)
 		}
+	}
+	
+	return nil
+}
+
+// main is the application entry point that sets up CLI and starts the server
+func main() {
+	// Create and execute the root command
+	rootCmd := createRootCommand()
+	
+	if err := rootCmd.Execute(); err != nil {
+		log.Fatalf("Application failed: %v", err)
 	}
 }

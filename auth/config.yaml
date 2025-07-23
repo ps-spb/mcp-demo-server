@@ -1,0 +1,45 @@
+# MCP Demo Server Configuration
+# This YAML file provides configuration options for the OAuth 2.1 MCP server.
+# Configuration precedence: CLI flags > Environment variables > YAML config > Defaults
+
+# Server configuration
+server:
+  # Host interface to bind to
+  # Use "localhost" for local development, "0.0.0.0" for containers/production
+  host: "localhost"
+  
+  # Server port (will auto-adjust based on TLS setting if not specified)
+  # Default: 8080 for HTTP, 8443 for HTTPS
+  port: "8080"
+
+# OAuth 2.1 configuration
+oauth:
+  # Token expiry time in seconds (default: 3600 = 1 hour)
+  token_expiry: 3600
+
+# TLS/HTTPS configuration  
+tls:
+  # Enable HTTPS/TLS (default: false for demo-friendly usage)
+  enabled: false
+  
+  # Certificate file path (auto-generated if not found)
+  cert_file: "server.crt"
+  
+  # Private key file path (auto-generated if not found)
+  key_file: "server.key"
+
+# Debug mode (enables verbose logging)
+debug: false
+
+# Example production configuration:
+# ---
+# server:
+#   host: "0.0.0.0"
+#   port: "8443"
+# oauth:
+#   token_expiry: 7200
+# tls:
+#   enabled: true
+#   cert_file: "/etc/ssl/certs/mcp-server.crt"
+#   key_file: "/etc/ssl/private/mcp-server.key"
+# debug: false
