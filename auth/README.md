@@ -1,5 +1,19 @@
 # MCP Demo Server - Phase 3 (OAuth 2.1 Authentication)
 
+[![Build Status](https://github.com/ps-spb/mcp-demo-server/actions/workflows/build-auth-server.yml/badge.svg)](https://github.com/ps-spb/mcp-demo-server/actions/workflows/build-auth-server.yml)
+[![Docker Image](https://img.shields.io/badge/docker-ready-blue?logo=docker)](https://github.com/ps-spb/mcp-demo-server/pkgs/container/auth-server)
+[![Go Version](https://img.shields.io/badge/go-1.24.5-00ADD8?logo=go)](https://golang.org/)
+[![OAuth 2.1](https://img.shields.io/badge/OAuth-2.1-green?logo=oauth)](https://datatracker.ietf.org/doc/html/draft-ietf-oauth-v2-1-10)
+[![MCP Protocol](https://img.shields.io/badge/MCP-2025--06--18-purple)](https://modelcontextprotocol.io/)
+
+[![Security Scanning](https://img.shields.io/badge/security-Trivy-orange?logo=security)](https://github.com/ps-spb/mcp-demo-server/actions)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![Multi-Arch](https://img.shields.io/badge/arch-amd64%20%7C%20arm64-blue)](https://github.com/ps-spb/mcp-demo-server/actions)
+[![Container Security](https://img.shields.io/badge/container-distroless-lightgrey?logo=docker)](https://github.com/GoogleContainerTools/distroless)
+
+[![GitHub stars](https://img.shields.io/github/stars/ps-spb/mcp-demo-server?style=social)](https://github.com/ps-spb/mcp-demo-server/stargazers)
+[![GitHub forks](https://img.shields.io/github/forks/ps-spb/mcp-demo-server?style=social)](https://github.com/ps-spb/mcp-demo-server/network/members)
+
 A Model Context Protocol (MCP) server implementation in Go that demonstrates OAuth 2.1 authentication following the MCP 2025-06-18 specification. This is the third and final phase of the educational MCP server series, adding comprehensive authentication and security features.
 
 ## Features

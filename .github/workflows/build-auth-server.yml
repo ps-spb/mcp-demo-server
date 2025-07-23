@@ -157,17 +157,69 @@ jobs:
           # Pull the built image
           docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           
-          # Run a quick smoke test (start container and check if it responds)
+          # Run container with proper environment variables for server binding
+          echo "🚀 Starting container..."
           docker run --rm -d --name mcp-test -p 8443:8443 \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest &
+            -e SERVER_HOST=0.0.0.0 \
+            -e SERVER_PORT=8443 \
+            -e DEBUG_MODE=true \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           
-          # Wait a moment for server to start
-          sleep 5
+          # Wait longer for Go server to fully start
+          echo "⏳ Waiting for server startup..."
+          sleep 15
           
-          # Test if the OAuth metadata endpoint responds
-          curl -f http://localhost:8443/.well-known/oauth-authorization-server || exit 1
+          # Check container is still running
+          if ! docker ps | grep -q mcp-test; then
+            echo "❌ Container failed to start or crashed"
+            docker logs mcp-test || true
+            exit 1
+          fi
+          
+          # Show container logs for debugging
+          echo "📋 Container logs:"
+          docker logs mcp-test
+          
+          # Test container networking
+          echo "🔍 Testing container network connectivity..."
+          docker exec mcp-test netstat -tlnp || true
+          
+          # Test if the OAuth metadata endpoint responds with retry logic
+          echo "🧪 Testing OAuth metadata endpoint..."
+          for i in {1..3}; do
+            echo "Attempt $i/3..."
+            if curl -v -f --connect-timeout 10 --max-time 30 \
+              http://localhost:8443/.well-known/oauth-authorization-server; then
+              echo "✅ OAuth endpoint test passed!"
+              break
+            else
+              echo "⚠️ Attempt $i failed, retrying in 5 seconds..."
+              if [ $i -eq 3 ]; then
+                echo "❌ All attempts failed"
+                echo "📋 Final container logs:"
+                docker logs mcp-test
+                echo "🔍 Container processes:"
+                docker exec mcp-test ps aux || true
+                exit 1
+              fi
+              sleep 5
+            fi
+          done
+          
+          # Test token endpoint as well
+          echo "🧪 Testing token endpoint..."
+          curl -v -f --connect-timeout 10 --max-time 30 \
+            -X POST \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -d "grant_type=client_credentials" \
+            http://localhost:8443/oauth/token || {
+            echo "❌ Token endpoint test failed"
+            docker logs mcp-test
+            exit 1
+          }
           
           # Clean up
+          echo "🧹 Cleaning up..."
           docker stop mcp-test || true
           
-          echo "✅ Smoke test passed!"
+          echo "✅ All smoke tests passed!"
