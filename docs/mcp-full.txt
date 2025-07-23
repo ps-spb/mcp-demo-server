@@ -1,0 +1,56 @@
+Model Context Protocol (MCP) Documentation
+
+The Model Context Protocol (MCP) is an open-source specification for enabling interoperable AI applications.
+
+Architecture:
+- Client-server model connecting LLM applications
+- Supports multiple transport mechanisms (stdio, HTTP)
+- Uses JSON-RPC 2.0 for message exchange
+
+Governance:
+- Community-driven development
+- Hierarchical structure with contributors, maintainers, and core maintainers
+- Specification Enhancement Proposal (SEP) process for proposing changes
+
+Roadmap Priorities:
+- Developing reference implementations
+- Creating a centralized server registry
+- Improving agent workflows
+- Expanding multimodal support
+- Establishing transparent community governance
+
+Clients:
+- Over 50 applications currently support MCP
+- Ranging from IDE plugins to standalone AI assistants
+- Varying levels of feature support (tools, resources, prompts)
+
+Unique Features:
+- Flexible protocol allowing dynamic tool and resource integration
+- Standardized communication between AI applications
+- Emphasis on community-driven development and interoperability
+
+The project aims to create a flexible, extensible protocol for AI application interactions, with a strong focus on community participation and open standards.
+
+Security Considerations:
+- Transport Security: Use TLS for remote connections
+- Message Validation: Validate all incoming messages
+- Resource Protection: Implement access controls
+- Error Handling: Avoid leaking sensitive information
+- Authentication: Implement appropriate authentication mechanisms
+
+OAuth 2.1 Authorization (for HTTP transports):
+- Authorization is optional for MCP implementations
+- HTTP-based transports should follow OAuth 2.1 specification
+- Based on OAuth 2.1 draft standards
+
+Key Implementation Guidelines:
+1. Authorization Server Discovery
+2. Token Handling with "Bearer" tokens
+3. Security Considerations including PKCE
+4. Client Requirements with resource parameters
+5. Error Handling (401, 403, 400 responses)
+
+Critical Security Principles:
+- "MCP servers MUST validate that tokens were issued specifically for them"
+- "Authorization servers MUST only accept tokens valid for their resources"
+- Prevent token passthrough between services

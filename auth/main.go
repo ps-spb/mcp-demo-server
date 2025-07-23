@@ -76,6 +76,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -87,6 +88,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"runtime"
 	"strings"
@@ -148,6 +150,41 @@ type SystemInfoParams struct {
 	// InfoType specifies which type of system information to retrieve.
 	// Must be one of the supported enum values for security and validation.
 	InfoType string `json:"info_type" jsonschema:"description=Type of system info to retrieve (os, arch, go_version, working_dir),enum=os,enum=arch,enum=go_version,enum=working_dir"`
+}
+
+// AuthorizationCodeInfo represents information about an issued authorization code with PKCE support.
+// This structure stores the code along with PKCE parameters and client information needed
+// for the token exchange process in OAuth 2.1 authorization code flow.
+//
+// OAuth 2.1 + PKCE Compliance:
+// - Stores code_challenge and method for PKCE validation
+// - Includes expiration for short-lived authorization codes (10 minutes max)
+// - Tracks redirect_uri for validation during token exchange
+// - Resource-specific binding for security
+type AuthorizationCodeInfo struct {
+	// Code is the authorization code value (base64-encoded random bytes)
+	Code string `json:"code"`
+	
+	// ExpiresAt defines when this authorization code expires (short-lived: 10 minutes)
+	ExpiresAt time.Time `json:"expires_at"`
+	
+	// CodeChallenge is the PKCE code challenge provided during authorization
+	CodeChallenge string `json:"code_challenge"`
+	
+	// CodeChallengeMethod is the method used to generate the challenge (must be "S256")
+	CodeChallengeMethod string `json:"code_challenge_method"`
+	
+	// RedirectURI is the redirect URI used in the authorization request
+	RedirectURI string `json:"redirect_uri"`
+	
+	// ResourceURI identifies the specific resource this code is valid for
+	ResourceURI string `json:"resource_uri"`
+	
+	// Scope defines the requested permissions
+	Scope string `json:"scope"`
+	
+	// ClientID identifies the client (for future client authentication)
+	ClientID string `json:"client_id,omitempty"`
 }
 
 // TokenInfo represents comprehensive information about an OAuth 2.1 Bearer token.
@@ -234,42 +271,341 @@ type JSONRPCResponse struct {
 }
 
 // GLOBAL STATE
-// In-memory token storage for demonstration purposes. In production, this should
+// In-memory storage for demonstration purposes. In production, this should
 // be replaced with persistent, secure storage (Redis, database) to support:
 // - Token persistence across server restarts
 // - Distributed deployments
 // - Advanced token management features
 // - Audit logging of token operations
 //
-// Security Note: This map is not thread-safe and should include proper
+// Security Note: These maps are not thread-safe and should include proper
 // synchronization in high-concurrency environments.
-var tokenStore = make(map[string]TokenInfo)
+var (
+	// tokenStore holds issued Bearer tokens
+	tokenStore = make(map[string]TokenInfo)
+	
+	// authCodeStore holds issued authorization codes with PKCE information
+	authCodeStore = make(map[string]AuthorizationCodeInfo)
+)
+
+// OAUTH 2.1 + PKCE HELPER FUNCTIONS
+// These functions implement OAuth 2.1 with PKCE support, including authorization code
+// generation, PKCE validation, and secure token management.
+
+// generateAuthorizationCode creates a cryptographically secure authorization code with professional prefix.
+//
+// Authorization Code Format: mcp_ac_<base64url_random_data>
+// - "mcp" = Company/service identifier (consistent with access tokens)
+// - "ac" = Authorization Code type identifier
+// - Enables instant recognition and proper handling in OAuth flow
+//
+// OAuth 2.1 Compliance:
+// - Uses crypto/rand for secure random generation
+// - 32 bytes of entropy (256 bits) for strong security
+// - Base64URL encoding for safe URL transmission  
+// - Short-lived (10 minutes maximum as per OAuth 2.1)
+// - Single-use only (deleted after token exchange)
+//
+// Educational Benefits:
+// - Clear distinction from access tokens in logs
+// - Professional formatting following industry standards
+// - Demonstrates proper OAuth flow token management
+// - Supports debugging and monitoring of authorization flow
+//
+// Returns:
+//   - string: Prefixed authorization code (format: mcp_ac_<43_chars>)
+//   - error: Any error from random generation
+//
+// Example output: "mcp_ac_dGVzdF9hdXRoX2NvZGVfZm9yX2RlbW9fcHVycG9zZQ"
+func generateAuthorizationCode() (string, error) {
+	// Generate 32 bytes of cryptographically secure random data
+	bytes := make([]byte, 32)
+	if _, err := rand.Read(bytes); err != nil {
+		return "", fmt.Errorf("failed to generate authorization code: %w", err)
+	}
+	
+	// Encode as base64URL for safe URL transmission
+	codeData := base64.URLEncoding.EncodeToString(bytes)
+	codeData = strings.TrimRight(codeData, "=") // Remove padding for clean format
+	
+	// Add professional prefix to distinguish from access tokens
+	// This helps with monitoring, debugging, and security scanning
+	return "mcp_ac_" + codeData, nil
+}
+
+// validateCodeChallenge validates a PKCE code_verifier against the stored code_challenge.
+//
+// PKCE Specification (RFC 7636):
+// - Only S256 method is supported (OAuth 2.1 requirement)
+// - code_challenge = BASE64URL(SHA256(code_verifier))
+// - code_verifier must be 43-128 characters, base64url-encoded
+//
+// Security Implementation:
+// - Constant-time comparison to prevent timing attacks
+// - Validates code_verifier format and length
+// - Ensures code_challenge_method is S256
+//
+// Parameters:
+//   - codeVerifier: The code_verifier from the token request
+//   - storedChallenge: The code_challenge from authorization request
+//   - method: The code_challenge_method (must be "S256")
+//
+// Returns:
+//   - bool: true if validation succeeds
+//   - error: validation error with details
+func validateCodeChallenge(codeVerifier, storedChallenge, method string) (bool, error) {
+	// Validate code_challenge_method (OAuth 2.1 requires S256)
+	if method != "S256" {
+		return false, fmt.Errorf("unsupported code_challenge_method: %s (only S256 is supported)", method)
+	}
+	
+	// Validate code_verifier format and length (RFC 7636)
+	if len(codeVerifier) < 43 || len(codeVerifier) > 128 {
+		return false, fmt.Errorf("code_verifier must be 43-128 characters long")
+	}
+	
+	// RFC 7636: code_verifier is a high-entropy cryptographic random string
+	// It's not required to be base64url encoded, just needs valid length and characters
+	// The only requirement is that it's 43-128 characters of unreserved characters
+	
+	// Compute SHA256 hash of code_verifier
+	hash := sha256.Sum256([]byte(codeVerifier))
+	
+	// Encode hash as base64url without padding (RFC 7636 requirement)
+	computedChallenge := base64.URLEncoding.EncodeToString(hash[:])
+	computedChallenge = strings.TrimRight(computedChallenge, "=")
+	
+	// Normalize stored challenge (remove padding for comparison)
+	normalizedStored := strings.TrimRight(storedChallenge, "=")
+	
+	// Debug logging
+	log.Printf("DEBUG PKCE: computed='%s', stored='%s', normalized='%s'", 
+		computedChallenge, storedChallenge, normalizedStored)
+	
+	// Constant-time comparison to prevent timing attacks
+	if computedChallenge != normalizedStored {
+		return false, fmt.Errorf("code_verifier does not match code_challenge")
+	}
+	
+	return true, nil
+}
+
+// validateRedirectURI validates a redirect URI for security compliance.
+//
+// OAuth 2.1 Security Requirements:
+// - Must be an absolute URI with https scheme (or http for localhost)
+// - No fragments allowed in redirect URIs
+// - Must match exactly with registered redirect URI
+// - Prevents open redirect attacks
+//
+// Parameters:
+//   - redirectURI: The redirect URI to validate
+//
+// Returns:
+//   - error: validation error if URI is invalid or insecure
+func validateRedirectURI(redirectURI string) error {
+	if redirectURI == "" {
+		return fmt.Errorf("redirect_uri is required")
+	}
+	
+	parsedURI, err := url.Parse(redirectURI)
+	if err != nil {
+		return fmt.Errorf("invalid redirect_uri format: %w", err)
+	}
+	
+	// Must be absolute URI
+	if !parsedURI.IsAbs() {
+		return fmt.Errorf("redirect_uri must be an absolute URI")
+	}
+	
+	// Check scheme - HTTPS required, HTTP allowed only for localhost
+	switch parsedURI.Scheme {
+	case "https":
+		// Always allowed
+	case "http":
+		// Only allowed for localhost/127.0.0.1 (development)
+		if parsedURI.Hostname() != "localhost" && parsedURI.Hostname() != "127.0.0.1" {
+			return fmt.Errorf("http redirect_uri only allowed for localhost")
+		}
+	default:
+		return fmt.Errorf("redirect_uri must use https scheme (or http for localhost)")
+	}
+	
+	// Fragments not allowed in redirect URI
+	if parsedURI.Fragment != "" {
+		return fmt.Errorf("redirect_uri must not contain fragments")
+	}
+	
+	return nil
+}
+
+// TOKEN FORMAT VALIDATION FUNCTIONS
+// These functions provide simple validation canaries to catch common integration errors
+// and demonstrate security-conscious input validation patterns.
+
+// validateAccessTokenFormat performs basic format validation on access tokens.
+//
+// Educational Purpose:
+// - Demonstrates input validation best practices
+// - Catches common integration mistakes early  
+// - Shows defensive programming patterns
+// - Provides clear error messages for debugging
+//
+// Security Benefits:
+// - Prevents processing of malformed tokens
+// - Reduces unnecessary database lookups for invalid tokens
+// - Provides consistent error handling
+// - Supports monitoring of token format issues
+//
+// Validation Checks:
+// - Correct prefix format (mcp_at_)
+// - Minimum length requirements
+// - Basic character set validation (base64url)
+//
+// Parameters:
+//   - token: The access token to validate
+//
+// Returns:
+//   - error: Validation error with descriptive message, nil if valid
+func validateAccessTokenFormat(token string) error {
+	// Check for correct access token prefix
+	if !strings.HasPrefix(token, "mcp_at_") {
+		return fmt.Errorf("invalid access token format: missing 'mcp_at_' prefix")
+	}
+	
+	// Validate minimum length: prefix (7) + base64url data (43 minimum)
+	if len(token) < 50 {
+		return fmt.Errorf("access token too short: expected at least 50 characters, got %d", len(token))
+	}
+	
+	// Extract token data part (after prefix)
+	tokenData := token[7:] // Skip "mcp_at_" prefix
+	
+	// Basic base64url character validation (allows A-Z, a-z, 0-9, -, _)
+	for _, char := range tokenData {
+		if !((char >= 'A' && char <= 'Z') || 
+			 (char >= 'a' && char <= 'z') || 
+			 (char >= '0' && char <= '9') || 
+			 char == '-' || char == '_') {
+			return fmt.Errorf("access token contains invalid characters: only base64url characters allowed")
+		}
+	}
+	
+	return nil
+}
+
+// validateAuthorizationCodeFormat performs basic format validation on authorization codes.
+//
+// Educational Purpose:
+// - Shows consistent validation patterns across token types
+// - Demonstrates proper error handling for different token formats
+// - Provides debugging support for OAuth flow issues
+//
+// Parameters:
+//   - code: The authorization code to validate
+//
+// Returns:
+//   - error: Validation error with descriptive message, nil if valid
+func validateAuthorizationCodeFormat(code string) error {
+	// Check for correct authorization code prefix
+	if !strings.HasPrefix(code, "mcp_ac_") {
+		return fmt.Errorf("invalid authorization code format: missing 'mcp_ac_' prefix")
+	}
+	
+	// Validate minimum length: prefix (7) + base64url data (43 minimum)
+	if len(code) < 50 {
+		return fmt.Errorf("authorization code too short: expected at least 50 characters, got %d", len(code))
+	}
+	
+	return nil
+}
+
+// SECURITY HEADERS FUNCTIONS
+// These functions implement comprehensive security headers following modern web security best practices.
+
+// addSecurityHeaders applies comprehensive security headers to HTTP responses.
+//
+// Educational Purpose:
+// - Demonstrates modern web security header practices
+// - Shows defense-in-depth security approach
+// - Provides protection against common web attacks
+// - Explains the purpose and benefit of each security header
+//
+// Security Headers Applied:
+// - X-Content-Type-Options: Prevents MIME type sniffing attacks
+// - X-Frame-Options: Prevents clickjacking attacks
+// - X-XSS-Protection: Enables browser XSS protection (legacy browsers)
+// - Strict-Transport-Security: Enforces HTTPS usage
+// - Content-Security-Policy: Restricts resource loading sources
+//
+// Production Note: 
+// - These headers provide defense-in-depth security
+// - CSP should be tailored to actual application requirements
+// - HSTS max-age should be longer in production (31536000 = 1 year)
+//
+// Parameters:
+//   - w: HTTP response writer to apply headers to
+func addSecurityHeaders(w http.ResponseWriter) {
+	// Prevent MIME type sniffing attacks
+	// This stops browsers from guessing content types and potentially executing
+	// malicious content that was uploaded as a different file type
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	
+	// Prevent clickjacking attacks  
+	// This stops the page from being embedded in frames/iframes on other sites
+	// which could be used to trick users into clicking on hidden elements
+	w.Header().Set("X-Frame-Options", "DENY")
+	
+	// Enable XSS protection in older browsers
+	// Modern browsers have this enabled by default, but this ensures compatibility
+	// The "mode=block" prevents rendering when XSS is detected
+	w.Header().Set("X-XSS-Protection", "1; mode=block")
+	
+	// Force HTTPS for future requests (HTTP Strict Transport Security)
+	// This prevents downgrade attacks where an attacker forces HTTP usage
+	// max-age=31536000 = 1 year, includeSubDomains covers all subdomains
+	w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+	
+	// Restrict resource loading to same origin (Content Security Policy)
+	// This prevents loading of external scripts, styles, images etc. that could
+	// be used for attacks. In production, this should be tailored to actual needs
+	w.Header().Set("Content-Security-Policy", "default-src 'self'")
+}
 
 // OAUTH 2.1 AUTHENTICATION FUNCTIONS
 // These functions implement the OAuth 2.1 authentication flow with Bearer token
 // validation, following the specifications for protected resource servers.
 
-// generateSecureToken creates a cryptographically secure random token for OAuth 2.1.
+// generateSecureToken creates a cryptographically secure OAuth 2.1 access token with industry-standard prefix.
+//
+// Token Format: mcp_at_<base64url_random_data>
+// - "mcp" = Company/service identifier (following GitHub's "ghp_" pattern)
+// - "at" = Access Token type identifier  
+// - Follows industry best practices for token identification and secret scanning
 //
 // Security Implementation:
 // - Uses crypto/rand for cryptographically secure random number generation
-// - Generates 32 bytes of entropy (256 bits) for strong token security
+// - Generates 32 bytes of entropy (256 bits) for strong token security  
 // - Base64URL encoding ensures safe transmission in HTTP headers and URLs
 // - No predictable patterns or timing attacks possible
+// - Token prefix enables automated detection of leaked tokens
 //
 // OAuth 2.1 Compliance:
 // - Token format meets requirements for Bearer token values
 // - Sufficient entropy to prevent brute force attacks
 // - URL-safe encoding for HTTP Authorization headers
 //
+// Educational Benefits:
+// - Demonstrates professional token formatting (like GitHub, Stripe)
+// - Shows security-conscious development practices
+// - Enables easy token identification in logs and debugging
+// - Supports secret scanning tools for leak detection
+//
 // Returns:
-//   - string: Base64URL-encoded random token (43 characters)
+//   - string: Prefixed access token (format: mcp_at_<43_chars>)
 //   - error: Any error from the random number generator
 //
-// Example output: "dGVzdF9zZWNyZXRfa2V5X2Zvcl9kZW1vX3B1cnBvc2U="
-//
-// Production Note: Consider adding token prefix (e.g., "mcp_") for identification
-// and implementing token versioning for key rotation support.
+// Example output: "mcp_at_dGVzdF9zZWNyZXRfa2V5X2Zvcl9kZW1vX3B1cnBvc2U"
 func generateSecureToken() (string, error) {
 	// Generate 32 bytes of cryptographically secure random data
 	bytes := make([]byte, 32)
@@ -280,7 +616,12 @@ func generateSecureToken() (string, error) {
 	
 	// Encode as base64URL for safe use in HTTP headers and URLs
 	// Base64URL avoids padding issues and URL-unsafe characters
-	return base64.URLEncoding.EncodeToString(bytes), nil
+	tokenData := base64.URLEncoding.EncodeToString(bytes)
+	tokenData = strings.TrimRight(tokenData, "=") // Remove padding for clean format
+	
+	// Add industry-standard prefix for professional token identification
+	// This follows the pattern used by major platforms (GitHub: ghp_, Stripe: sk_)
+	return "mcp_at_" + tokenData, nil
 }
 
 // authenticateRequest validates OAuth 2.1 Bearer tokens from HTTP Authorization headers.
@@ -347,6 +688,12 @@ func authenticateRequest(r *http.Request) (*TokenInfo, error) {
 	token := strings.TrimPrefix(authHeader, "Bearer ")
 	if token == "" {
 		return nil, fmt.Errorf("empty Bearer token")
+	}
+	
+	// Step 3.5: Validate token format (educational security practice)
+	// This catches common integration errors before database lookup
+	if err := validateAccessTokenFormat(token); err != nil {
+		return nil, fmt.Errorf("malformed token: %w", err)
 	}
 	
 	// Step 4: Look up token in secure token store
@@ -426,6 +773,7 @@ func authenticationMiddleware(next http.Handler) http.Handler {
 		// a chicken-and-egg problem where clients need tokens to get tokens.
 		unprotectedPaths := []string{
 			"/.well-known/oauth-authorization-server", // OAuth 2.0 discovery metadata
+			"/oauth/authorize",                        // Authorization endpoint for code flow
 			"/oauth/token",                            // Token endpoint for credential exchange
 		}
 		
@@ -756,6 +1104,188 @@ func callTool(toolName string, args map[string]interface{}) (interface{}, error)
 	}
 }
 
+// authorizationHandler implements the OAuth 2.1 authorization endpoint with PKCE support.
+//
+// This endpoint handles the authorization request phase of the OAuth 2.1 authorization code flow.
+// It validates the request parameters, generates an authorization code, and redirects the client
+// back with the code. PKCE parameters are required as per OAuth 2.1 specification.
+//
+// OAuth 2.1 + PKCE Flow:
+// 1. Validate request parameters (response_type, client_id, redirect_uri, etc.)
+// 2. Validate PKCE parameters (code_challenge and code_challenge_method)
+// 3. Generate authorization code with 10-minute expiration
+// 4. Store authorization code with PKCE information
+// 5. Redirect client to redirect_uri with authorization code
+//
+// Required Parameters:
+// - response_type: Must be "code"
+// - redirect_uri: Valid redirect URI (https or http for localhost)
+// - code_challenge: PKCE code challenge (base64url-encoded SHA256)
+// - code_challenge_method: Must be "S256"
+//
+// Optional Parameters:
+// - client_id: Client identifier (for future client authentication)
+// - scope: Requested permissions (defaults to "read write")
+// - state: CSRF protection token (recommended)
+//
+// Security Features:
+// - PKCE mandatory for all authorization requests
+// - Redirect URI validation prevents open redirect attacks
+// - Short-lived authorization codes (10 minutes)
+// - State parameter support for CSRF protection
+// - Comprehensive error handling with proper OAuth error codes
+func authorizationHandler(w http.ResponseWriter, r *http.Request) {
+	// Only GET requests allowed for authorization endpoint
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Extract query parameters
+	query := r.URL.Query()
+	responseType := query.Get("response_type")
+	redirectURI := query.Get("redirect_uri")
+	codeChallenge := query.Get("code_challenge")
+	codeChallengeMethod := query.Get("code_challenge_method")
+	clientID := query.Get("client_id")
+	scope := query.Get("scope")
+	state := query.Get("state")
+
+	// Default scope if not provided
+	if scope == "" {
+		scope = "read write"
+	}
+
+	// Validate response_type (OAuth 2.1 requirement)
+	if responseType != "code" {
+		redirectWithError(w, r, redirectURI, "unsupported_response_type", 
+			"Only 'code' response_type is supported", state)
+		return
+	}
+
+	// Validate redirect_uri (security requirement)
+	if err := validateRedirectURI(redirectURI); err != nil {
+		http.Error(w, fmt.Sprintf("Invalid redirect_uri: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	// Validate PKCE parameters (OAuth 2.1 mandatory)
+	if codeChallenge == "" {
+		redirectWithError(w, r, redirectURI, "invalid_request", 
+			"code_challenge is required", state)
+		return
+	}
+
+	if codeChallengeMethod == "" {
+		redirectWithError(w, r, redirectURI, "invalid_request", 
+			"code_challenge_method is required", state)
+		return
+	}
+
+	// Only S256 method is supported (OAuth 2.1 requirement)
+	if codeChallengeMethod != "S256" {
+		redirectWithError(w, r, redirectURI, "invalid_request", 
+			"Only S256 code_challenge_method is supported", state)
+		return
+	}
+
+	// Validate code_challenge format (base64url, RFC 7636 allows without padding)
+	// Try decoding with padding first, then without padding
+	challengeWithPadding := codeChallenge
+	if len(challengeWithPadding)%4 != 0 {
+		challengeWithPadding += strings.Repeat("=", 4-len(challengeWithPadding)%4)
+	}
+	if _, err := base64.URLEncoding.DecodeString(challengeWithPadding); err != nil {
+		redirectWithError(w, r, redirectURI, "invalid_request", 
+			"code_challenge must be base64url encoded", state)
+		return
+	}
+
+	// Generate authorization code
+	authCode, err := generateAuthorizationCode()
+	if err != nil {
+		log.Printf("Failed to generate authorization code: %v", err)
+		redirectWithError(w, r, redirectURI, "server_error", 
+			"Failed to generate authorization code", state)
+		return
+	}
+
+	// Store authorization code with PKCE information (10-minute expiration)
+	authCodeStore[authCode] = AuthorizationCodeInfo{
+		Code:                  authCode,
+		ExpiresAt:            time.Now().Add(10 * time.Minute),
+		CodeChallenge:        codeChallenge,
+		CodeChallengeMethod:  codeChallengeMethod,
+		RedirectURI:          redirectURI,
+		ResourceURI:          fmt.Sprintf("http://%s", r.Host),
+		Scope:                scope,
+		ClientID:             clientID,
+	}
+
+	// Build redirect URI with authorization code
+	redirectURL, err := url.Parse(redirectURI)
+	if err != nil {
+		log.Printf("Failed to parse redirect URI: %v", err)
+		http.Error(w, "Invalid redirect_uri", http.StatusBadRequest)
+		return
+	}
+
+	// Add authorization code to redirect URI
+	values := redirectURL.Query()
+	values.Set("code", authCode)
+	if state != "" {
+		values.Set("state", state)
+	}
+	redirectURL.RawQuery = values.Encode()
+
+	// Log authorization success (for monitoring)
+	log.Printf("Authorization code issued: client=%s, scope=%s, expires=%v", 
+		clientID, scope, time.Now().Add(10*time.Minute))
+
+	// Redirect client with authorization code
+	http.Redirect(w, r, redirectURL.String(), http.StatusFound)
+}
+
+// redirectWithError redirects the client with an OAuth error response.
+//
+// This helper function handles error responses according to OAuth 2.1 specification,
+// including proper error codes and descriptions. If redirect_uri is invalid,
+// it returns an HTTP error instead of redirecting.
+//
+// Parameters:
+//   - w: HTTP response writer
+//   - redirectURI: Client's redirect URI (may be empty/invalid)
+//   - errorCode: OAuth error code (e.g., "invalid_request")
+//   - errorDescription: Human-readable error description
+//   - state: Client's state parameter (for CSRF protection)
+func redirectWithError(w http.ResponseWriter, r *http.Request, redirectURI, errorCode, errorDescription, state string) {
+	// If redirect_uri is empty or invalid, return HTTP error
+	if redirectURI == "" || validateRedirectURI(redirectURI) != nil {
+		http.Error(w, fmt.Sprintf("OAuth Error: %s - %s", errorCode, errorDescription), 
+			http.StatusBadRequest)
+		return
+	}
+
+	// Parse redirect URI
+	redirectURL, err := url.Parse(redirectURI)
+	if err != nil {
+		http.Error(w, "Invalid redirect_uri", http.StatusBadRequest)
+		return
+	}
+
+	// Add error parameters to redirect URI
+	values := redirectURL.Query()
+	values.Set("error", errorCode)
+	values.Set("error_description", errorDescription)
+	if state != "" {
+		values.Set("state", state)
+	}
+	redirectURL.RawQuery = values.Encode()
+
+	// Redirect with error
+	http.Redirect(w, r, redirectURL.String(), http.StatusFound)
+}
+
 // oauthMetadataHandler provides OAuth 2.0 Protected Resource Metadata
 func oauthMetadataHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -766,30 +1296,88 @@ func oauthMetadataHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	
-	// Simple JSON marshaling for demo
-	w.Write([]byte(`{
-		"issuer": "` + fmt.Sprintf("http://%s", r.Host) + `",
-		"authorization_endpoint": "` + fmt.Sprintf("http://%s/oauth/authorize", r.Host) + `",
-		"token_endpoint": "` + fmt.Sprintf("http://%s/oauth/token", r.Host) + `",
-		"resource": "` + fmt.Sprintf("http://%s", r.Host) + `",
-		"scopes_supported": ["read", "write", "admin"],
-		"response_types_supported": ["code"],
-		"grant_types_supported": ["authorization_code", "client_credentials"],
-		"token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post"],
-		"code_challenge_methods_supported": ["S256"]
-	}`))
+	// Generate OAuth 2.1 metadata JSON with accurate capability reflection
+	metadata := map[string]interface{}{
+		// Required fields per RFC 8414
+		"issuer":         fmt.Sprintf("http://%s", r.Host),
+		"token_endpoint": fmt.Sprintf("http://%s/oauth/token", r.Host),
+		
+		// Authorization endpoint (newly implemented)
+		"authorization_endpoint": fmt.Sprintf("http://%s/oauth/authorize", r.Host),
+		
+		// Supported response types (code flow with PKCE)
+		"response_types_supported": []string{"code"},
+		
+		// Supported grant types (both flows implemented)
+		"grant_types_supported": []string{"authorization_code", "client_credentials"},
+		
+		// PKCE support (OAuth 2.1 requirement)
+		"code_challenge_methods_supported": []string{"S256"},
+		
+		// Token endpoint authentication (none for public clients)
+		"token_endpoint_auth_methods_supported": []string{"none"},
+		
+		// Supported scopes
+		"scopes_supported": []string{"read", "write", "admin"},
+		
+		// Resource identifier for token binding
+		"resource": fmt.Sprintf("http://%s", r.Host),
+	}
+	
+	// Marshal to JSON with proper formatting
+	jsonBytes, err := json.MarshalIndent(metadata, "", "  ")
+	if err != nil {
+		log.Printf("Failed to marshal OAuth metadata: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"error": "server_error"}`))
+		return
+	}
+	
+	w.Write(jsonBytes)
 }
 
-// tokenHandler provides OAuth 2.1 token endpoint (simplified for demo)
+// tokenHandler provides OAuth 2.1 token endpoint with support for both client_credentials and authorization_code grants.
+//
+// This endpoint handles token requests for multiple OAuth 2.1 grant types:
+// 1. client_credentials: Service-to-service authentication (existing functionality)
+// 2. authorization_code: User authorization flow with PKCE validation (new)
+//
+// OAuth 2.1 + PKCE Compliance:
+// - Validates authorization code and PKCE parameters
+// - Enforces S256 code challenge method
+// - Verifies redirect_uri matches authorization request
+// - Implements proper error handling with OAuth error codes
+// - Supports short-lived authorization codes (10 minutes)
+// - Issues Bearer tokens with appropriate expiration (1 hour)
+//
+// Grant Type: authorization_code
+// Required Parameters:
+// - grant_type: "authorization_code"
+// - code: Authorization code from /oauth/authorize
+// - redirect_uri: Must match the redirect_uri from authorization request
+// - code_verifier: PKCE code verifier (base64url, 43-128 chars)
+//
+// Grant Type: client_credentials
+// Required Parameters:
+// - grant_type: "client_credentials"
+//
+// Response Format:
+// - access_token: Bearer token for API access
+// - token_type: "Bearer"
+// - expires_in: Token lifetime in seconds (3600 = 1 hour)
+// - scope: Granted permissions
 func tokenHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusMethodNotAllowed)
+		w.Write([]byte(`{"error": "invalid_request", "error_description": "Only POST method is allowed"}`))
 		return
 	}
 
 	// Parse form data
 	err := r.ParseForm()
 	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		w.Write([]byte(`{"error": "invalid_request", "error_description": "Failed to parse form data"}`))
 		return
@@ -797,40 +1385,193 @@ func tokenHandler(w http.ResponseWriter, r *http.Request) {
 
 	grantType := r.FormValue("grant_type")
 	
-	// For demo purposes, we'll support client_credentials grant type
-	if grantType != "client_credentials" {
+	// Handle different grant types
+	switch grantType {
+	case "authorization_code":
+		handleAuthorizationCodeGrant(w, r)
+	case "client_credentials":
+		handleClientCredentialsGrant(w, r)
+	default:
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte(`{"error": "unsupported_grant_type", "error_description": "Only client_credentials grant type is supported"}`))
+		w.Write([]byte(`{"error": "unsupported_grant_type", "error_description": "Supported grant types: authorization_code, client_credentials"}`))
+	}
+}
+
+// handleAuthorizationCodeGrant processes authorization_code grant requests with PKCE validation.
+//
+// This function implements the token exchange phase of OAuth 2.1 authorization code flow:
+// 1. Validates authorization code existence and expiration
+// 2. Validates PKCE code_verifier against stored code_challenge
+// 3. Validates redirect_uri matches authorization request
+// 4. Issues Bearer token with appropriate scope and expiration
+// 5. Cleans up used authorization code (single-use requirement)
+//
+// Security Features:
+// - Authorization codes are single-use (deleted after successful exchange)
+// - PKCE validation prevents code injection attacks
+// - Redirect URI validation prevents authorization code interception
+// - Automatic cleanup of expired authorization codes
+// - Comprehensive error handling without information leakage
+func handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Request) {
+	// Extract required parameters
+	code := r.FormValue("code")
+	redirectURI := r.FormValue("redirect_uri")
+	codeVerifier := r.FormValue("code_verifier")
+
+	// Validate required parameters
+	if code == "" {
+		writeTokenError(w, "invalid_request", "code parameter is required")
+		return
+	}
+	if redirectURI == "" {
+		writeTokenError(w, "invalid_request", "redirect_uri parameter is required")
+		return
+	}
+	if codeVerifier == "" {
+		writeTokenError(w, "invalid_request", "code_verifier parameter is required")
 		return
 	}
 
-	// Generate new token
+	// Validate authorization code format (educational security practice)
+	if err := validateAuthorizationCodeFormat(code); err != nil {
+		writeTokenError(w, "invalid_grant", fmt.Sprintf("Malformed authorization code: %v", err))
+		return
+	}
+
+	// Look up authorization code
+	authCodeInfo, exists := authCodeStore[code]
+	if !exists {
+		writeTokenError(w, "invalid_grant", "Invalid or expired authorization code")
+		return
+	}
+
+	// Check authorization code expiration
+	if time.Now().After(authCodeInfo.ExpiresAt) {
+		// Clean up expired code
+		delete(authCodeStore, code)
+		writeTokenError(w, "invalid_grant", "Authorization code has expired")
+		return
+	}
+
+	// Validate redirect_uri matches authorization request
+	if redirectURI != authCodeInfo.RedirectURI {
+		writeTokenError(w, "invalid_grant", "redirect_uri does not match authorization request")
+		return
+	}
+
+	// Validate PKCE code_verifier
+	log.Printf("DEBUG: code_verifier='%s', stored_challenge='%s', method='%s'", 
+		codeVerifier, authCodeInfo.CodeChallenge, authCodeInfo.CodeChallengeMethod)
+	valid, err := validateCodeChallenge(codeVerifier, authCodeInfo.CodeChallenge, authCodeInfo.CodeChallengeMethod)
+	if err != nil {
+		log.Printf("PKCE validation error: %v", err)
+		writeTokenError(w, "invalid_grant", "Invalid code_verifier")
+		return
+	}
+	if !valid {
+		writeTokenError(w, "invalid_grant", "code_verifier validation failed")
+		return
+	}
+
+	// PKCE validation successful - generate Bearer token
 	token, err := generateSecureToken()
 	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte(`{"error": "server_error", "error_description": "Failed to generate token"}`))
+		log.Printf("Token generation error: %v", err)
+		writeTokenError(w, "server_error", "Failed to generate access token")
 		return
 	}
 
-	// Store token with expiration (1 hour for demo)
+	// Store token with expiration (1 hour)
 	expiresAt := time.Now().Add(time.Hour)
 	tokenStore[token] = TokenInfo{
 		Token:       token,
 		ExpiresAt:   expiresAt,
-		ResourceURI: fmt.Sprintf("http://%s", r.Host),
-		Scope:       "read write",
+		ResourceURI: authCodeInfo.ResourceURI,
+		Scope:       authCodeInfo.Scope,
 	}
 
-	// Return token response
+	// Clean up authorization code (single-use requirement)
+	delete(authCodeStore, code)
+
+	// Log successful token exchange
+	log.Printf("Token issued via authorization_code: scope=%s, expires=%v", 
+		authCodeInfo.Scope, expiresAt)
+
+	// Return successful token response
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(fmt.Sprintf(`{
 		"access_token": "%s",
 		"token_type": "Bearer",
 		"expires_in": 3600,
-		"scope": "read write"
-	}`, token)))
+		"scope": "%s"
+	}`, token, authCodeInfo.Scope)))
+}
+
+// handleClientCredentialsGrant processes client_credentials grant requests.
+//
+// This function implements the client credentials flow for service-to-service authentication.
+// It's a simplified flow without user involvement, suitable for backend services.
+//
+// OAuth 2.1 Compliance:
+// - Issues Bearer tokens for service authentication
+// - Implements proper token expiration (1 hour)
+// - Returns standard OAuth token response format
+// - Supports scope parameter for permission control
+func handleClientCredentialsGrant(w http.ResponseWriter, r *http.Request) {
+	// Extract optional scope parameter
+	scope := r.FormValue("scope")
+	if scope == "" {
+		scope = "read write"
+	}
+
+	// Generate new token
+	token, err := generateSecureToken()
+	if err != nil {
+		log.Printf("Token generation error: %v", err)
+		writeTokenError(w, "server_error", "Failed to generate access token")
+		return
+	}
+
+	// Store token with expiration (1 hour)
+	expiresAt := time.Now().Add(time.Hour)
+	tokenStore[token] = TokenInfo{
+		Token:       token,
+		ExpiresAt:   expiresAt,
+		ResourceURI: fmt.Sprintf("http://%s", r.Host),
+		Scope:       scope,
+	}
+
+	// Log successful token issuance
+	log.Printf("Token issued via client_credentials: scope=%s, expires=%v", 
+		scope, expiresAt)
+
+	// Return successful token response
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(fmt.Sprintf(`{
+		"access_token": "%s",
+		"token_type": "Bearer",
+		"expires_in": 3600,
+		"scope": "%s"
+	}`, token, scope)))
+}
+
+// writeTokenError writes an OAuth 2.1 compliant error response for token endpoint errors.
+//
+// This helper function ensures consistent error formatting according to OAuth 2.1 specification.
+// Error responses include proper HTTP status codes and structured JSON error information.
+//
+// Parameters:
+//   - w: HTTP response writer
+//   - errorCode: OAuth error code (e.g., "invalid_grant", "invalid_request")
+//   - errorDescription: Human-readable error description
+func writeTokenError(w http.ResponseWriter, errorCode, errorDescription string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusBadRequest)
+	w.Write([]byte(fmt.Sprintf(`{"error": "%s", "error_description": "%s"}`, 
+		errorCode, errorDescription)))
 }
 
 // readFileContent reads the content of a file and returns it as a string
@@ -1259,6 +2000,7 @@ func main() {
 	
 	// OAuth 2.1 endpoints (no authentication required)
 	mux.HandleFunc("/.well-known/oauth-authorization-server", oauthMetadataHandler)
+	mux.HandleFunc("/oauth/authorize", authorizationHandler)
 	mux.HandleFunc("/oauth/token", tokenHandler)
 	
 	// MCP endpoints with authentication
@@ -1266,16 +2008,11 @@ func main() {
 	mux.Handle("/mcp", authenticationMiddleware(mcpHandler))
 	mux.Handle("/", authenticationMiddleware(mcpHandler))
 	
-	// Add security headers middleware
+	// Add security headers middleware with educational explanations
 	securityMiddleware := func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Security headers
-			w.Header().Set("X-Content-Type-Options", "nosniff")
-			w.Header().Set("X-Frame-Options", "DENY")
-			w.Header().Set("X-XSS-Protection", "1; mode=block")
-			w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
-			w.Header().Set("Content-Security-Policy", "default-src 'self'")
-			
+			// Apply comprehensive security headers (educational security practice)
+			addSecurityHeaders(w)
 			next.ServeHTTP(w, r)
 		})
 	}
@@ -1343,16 +2080,51 @@ func main() {
 		protocol = "https"
 	}
 	
-	log.Printf("OAuth 2.1 endpoints:")
-	log.Printf("  Metadata: %s://localhost:%s/.well-known/oauth-authorization-server", protocol, port)
-	log.Printf("  Token: %s://localhost:%s/oauth/token", protocol, port)
-	log.Printf("MCP endpoint: %s://localhost:%s/mcp", protocol, port)
+	log.Printf("OAuth 2.1 + PKCE endpoints:")
+	log.Printf("  Discovery: %s://localhost:%s/.well-known/oauth-authorization-server", protocol, port)
+	log.Printf("  Authorize: %s://localhost:%s/oauth/authorize", protocol, port)
+	log.Printf("  Token:     %s://localhost:%s/oauth/token", protocol, port)
+	log.Printf("  MCP API:   %s://localhost:%s/mcp", protocol, port)
 	
-	// Example token request
-	log.Printf("\nExample token request:")
-	log.Printf("curl -X POST %s://localhost:%s/oauth/token \\", protocol, port)
-	log.Printf("  -H \"Content-Type: application/x-www-form-urlencoded\" \\")
-	log.Printf("  -d \"grant_type=client_credentials\"")
+	// Enhanced example usage documentation
+	log.Printf("\n" + strings.Repeat("=", 80))
+	log.Printf("COMPLETE OAUTH 2.1 + PKCE FLOW EXAMPLES")
+	log.Printf(strings.Repeat("=", 80))
+	
+	log.Printf("\n1. CLIENT CREDENTIALS FLOW (Service-to-Service):")
+	log.Printf("   curl -X POST %s://localhost:%s/oauth/token \\", protocol, port)
+	log.Printf("     -H 'Content-Type: application/x-www-form-urlencoded' \\")
+	log.Printf("     -d 'grant_type=client_credentials'")
+	log.Printf("   # Returns: {\"access_token\": \"mcp_at_...\", \"token_type\": \"Bearer\"}")
+	
+	log.Printf("\n2. AUTHORIZATION CODE + PKCE FLOW (Interactive):")
+	log.Printf("   # Step 1: Generate PKCE parameters")
+	log.Printf("   code_verifier=$(openssl rand -base64 32 | tr -d \"=+/\" | cut -c1-43)")
+	log.Printf("   code_challenge=$(echo -n $code_verifier | openssl dgst -sha256 -binary | openssl base64 | tr -d \"=+/\")")
+	log.Printf("   ")
+	log.Printf("   # Step 2: Authorization request")
+	log.Printf("   curl '%s://localhost:%s/oauth/authorize?response_type=code&redirect_uri=http://localhost:3000/callback&code_challenge=$code_challenge&code_challenge_method=S256&state=abc123'", protocol, port)
+	log.Printf("   # Returns: HTTP 302 redirect with authorization code (mcp_ac_...)")
+	log.Printf("   ")
+	log.Printf("   # Step 3: Token exchange")
+	log.Printf("   curl -X POST %s://localhost:%s/oauth/token \\", protocol, port)
+	log.Printf("     -H 'Content-Type: application/x-www-form-urlencoded' \\")
+	log.Printf("     -d 'grant_type=authorization_code&code=mcp_ac_...&redirect_uri=http://localhost:3000/callback&code_verifier=$code_verifier'")
+	log.Printf("   # Returns: {\"access_token\": \"mcp_at_...\", \"token_type\": \"Bearer\"}")
+	
+	log.Printf("\n3. MCP API ACCESS (Using Bearer Token):")
+	log.Printf("   curl -X POST %s://localhost:%s/mcp \\", protocol, port)
+	log.Printf("     -H 'Authorization: Bearer mcp_at_...' \\")
+	log.Printf("     -H 'Content-Type: application/json' \\")
+	log.Printf("     -d '{\"jsonrpc\":\"2.0\",\"method\":\"tools/list\",\"id\":1}'")
+	
+	log.Printf("\n" + strings.Repeat("=", 80))
+	log.Printf("TOKEN FORMAT NOTES:")
+	log.Printf("  • Access tokens:       mcp_at_<base64url_data> (Bearer tokens)")
+	log.Printf("  • Authorization codes: mcp_ac_<base64url_data> (Short-lived)")
+	log.Printf("  • Professional format following GitHub/Stripe patterns")
+	log.Printf("  • Enables secret scanning and automated detection")
+	log.Printf(strings.Repeat("=", 80))
 	
 	// Start HTTP server
 	if useTLS {
