@@ -1,0 +1,173 @@
+# GitHub Actions workflow to build and push Docker image for MCP Demo Auth Server
+# This workflow builds a production-ready Docker image with multi-architecture support
+
+name: Build Auth Server Docker Image
+
+# Trigger the workflow on push to main branch and pull requests
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'auth/**'
+      - '.github/workflows/build-auth-server.yml'
+  pull_request:
+    branches: [ main, master ]
+    paths:
+      - 'auth/**'
+      - '.github/workflows/build-auth-server.yml'
+  workflow_dispatch: # Allow manual workflow runs
+
+# Set environment variables for the workflow
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/auth-server
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    # Set permissions for GitHub token to write to packages
+    permissions:
+      contents: read
+      packages: write
+      security-events: write # For Trivy security scanning
+    
+    steps:
+      # Step 1: Checkout the repository code
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Fetch full history for better cache invalidation
+          fetch-depth: 0
+
+      # Step 2: Set up Docker Buildx for multi-platform builds
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          # Use Docker container driver for better performance
+          driver: docker-container
+          driver-opts: network=host
+
+      # Step 3: Log in to GitHub Container Registry
+      - name: Log in to Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Step 4: Extract metadata for Docker tags and labels
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # Tag with branch name for branches
+            type=ref,event=branch
+            # Tag with PR number for pull requests
+            type=ref,event=pr
+            # Tag with git SHA for all builds
+            type=sha,prefix={{branch}}-
+            # Tag as 'latest' for main branch
+            type=raw,value=latest,enable={{is_default_branch}}
+            # Tag with version for tags (if using git tags)
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      # Step 5: Build and push Docker image
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          # Build context is the auth server directory
+          context: ./auth
+          file: ./auth/Dockerfile
+          
+          # Multi-platform build for broader compatibility
+          platforms: linux/amd64,linux/arm64
+          
+          # Push only if not a pull request
+          push: ${{ github.event_name != 'pull_request' }}
+          
+          # Apply tags and labels from metadata step
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          
+          # Enable Docker layer caching for faster builds
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          
+          # Build arguments for better reproducibility
+          build-args: |
+            BUILDTIME=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] }}
+            VERSION=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.version'] }}
+            REVISION=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.revision'] }}
+
+      # Step 6: Run Trivy vulnerability scanner (security best practice)
+      - name: Run Trivy vulnerability scanner
+        if: github.event_name != 'pull_request'
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      # Step 7: Upload Trivy scan results to GitHub Security tab
+      - name: Upload Trivy scan results to GitHub Security tab
+        if: github.event_name != 'pull_request'
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      # Step 8: Generate build summary
+      - name: Generate build summary
+        if: always()
+        run: |
+          echo "## 🐳 Docker Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Tags:** ${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Platforms:** linux/amd64, linux/arm64" >> $GITHUB_STEP_SUMMARY
+          echo "**Build Context:** auth/" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "✅ **Image pushed to registry**" >> $GITHUB_STEP_SUMMARY
+            echo "🔍 **Security scan completed**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "🔄 **Pull request build - image not pushed**" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # Optional: Test job to verify the built image works
+  test:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Test Docker image
+        run: |
+          # Pull the built image
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          
+          # Run a quick smoke test (start container and check if it responds)
+          docker run --rm -d --name mcp-test -p 8443:8443 \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest &
+          
+          # Wait a moment for server to start
+          sleep 5
+          
+          # Test if the OAuth metadata endpoint responds
+          curl -f http://localhost:8443/.well-known/oauth-authorization-server || exit 1
+          
+          # Clean up
+          docker stop mcp-test || true
+          
+          echo "✅ Smoke test passed!"

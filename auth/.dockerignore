@@ -1,0 +1,74 @@
+# Docker ignore file for MCP Demo OAuth 2.1 Server
+# Excludes unnecessary files from Docker build context for faster builds
+
+# Compiled binaries (will be built inside container)
+mcp-demo-server
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binaries
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Logs and runtime files
+*.log
+server.log
+
+# Development certificates (container should generate or mount its own)
+server.crt
+server.key
+*.pem
+*.crt
+*.key
+
+# Go workspace files
+go.work
+go.work.sum
+
+# Editor and IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS-specific files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+
+# Documentation (not needed in container)
+README.md
+*.md
+
+# Git files
+.git/
+.gitignore
+
+# Docker files (recursive builds not needed)
+Dockerfile*
+.dockerignore
+docker-compose*.yml
+
+# Build artifacts that might exist
+dist/
+build/
+bin/
+
+# Environment files (should be injected at runtime)
+.env
+.env.local
+.env.*.local

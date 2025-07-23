@@ -1,0 +1,100 @@
+# Docker Compose configuration for MCP Demo Server development
+# This file provides a convenient way to run the OAuth 2.1 MCP server locally
+
+version: '3.8'
+
+services:
+  # OAuth 2.1 authenticated MCP server
+  auth-server:
+    build:
+      context: ./auth
+      dockerfile: Dockerfile
+    
+    # Container name for easy reference
+    container_name: mcp-demo-auth-server
+    
+    # Port mapping: host:container
+    ports:
+      - "8443:8443"  # OAuth 2.1 MCP server port
+    
+    # Environment variables for configuration
+    environment:
+      # Server configuration
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=8443
+      - SERVER_NAME=mcp-demo-server-auth
+      
+      # OAuth 2.1 configuration
+      - OAUTH_TOKEN_EXPIRY=3600  # 1 hour in seconds
+      
+      # Development mode settings
+      - DEBUG_MODE=true
+      - LOG_LEVEL=info
+    
+    # Health check to ensure container is ready
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8443/.well-known/oauth-authorization-server"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    
+    # Restart policy for development
+    restart: unless-stopped
+    
+    # Optional: Mount volumes for development
+    # Uncomment the following lines if you want to mount source code for live development
+    # volumes:
+    #   - ./auth:/app:rw
+    
+    # Resource limits (optional, good for development)
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.5'
+        reservations:
+          memory: 64M
+          cpus: '0.1'
+    
+    # Network configuration
+    networks:
+      - mcp-demo
+
+# Optional: Additional services for a complete development setup
+  
+  # Uncomment the following if you want to add additional services
+  # like a database, Redis, or monitoring tools
+  
+  # # Redis for token storage (production-like setup)
+  # redis:
+  #   image: redis:7-alpine
+  #   container_name: mcp-demo-redis
+  #   ports:
+  #     - "6379:6379"
+  #   volumes:
+  #     - redis-data:/data
+  #   networks:
+  #     - mcp-demo
+  
+  # # Monitoring with Prometheus (optional)
+  # prometheus:
+  #   image: prom/prometheus:latest
+  #   container_name: mcp-demo-prometheus
+  #   ports:
+  #     - "9090:9090"
+  #   volumes:
+  #     - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+  #   networks:
+  #     - mcp-demo
+
+# Define networks
+networks:
+  mcp-demo:
+    driver: bridge
+    name: mcp-demo-network
+
+# Define volumes (if using additional services)
+# volumes:
+#   redis-data:
+#     driver: local
