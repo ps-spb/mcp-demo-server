@@ -70,8 +70,8 @@ jobs:
             type=ref,event=pr
             # Tag with git SHA for all builds
             type=sha,prefix={{branch}}-
-            # Tag as 'latest' for main branch
-            type=raw,value=latest,enable={{is_default_branch}}
+            # Always tag as 'latest' for every successful build
+            type=raw,value=latest
             # Tag with version for tags (if using git tags)
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -154,7 +154,7 @@ jobs:
       
       - name: Test Docker image
         run: |
-          # Pull the built image
+          # Pull the actual built image (latest will always exist now)
           docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           
           # Run container with proper environment variables for server binding
