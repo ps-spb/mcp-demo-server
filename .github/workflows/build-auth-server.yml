@@ -68,8 +68,8 @@ jobs:
             type=ref,event=branch
             # Tag with PR number for pull requests
             type=ref,event=pr
-            # Tag with git SHA for all builds
-            type=sha,prefix={{branch}}-
+            # Tag with git SHA (simple format)
+            type=sha
             # Always tag as 'latest' for every successful build
             type=raw,value=latest
             # Tag with version for tags (if using git tags)
